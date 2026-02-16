@@ -139,7 +139,7 @@ sas-netdiag/
 **"No module named _tkinter"**
 → Reinstall Python with the "tcl/tk" option checked
 
-**Executable is very large (100MB+)**
+**Executable is around 20-25MB
 → Normal for PyInstaller with CustomTkinter. The --onefile flag bundles everything.
 
 **Antivirus flags the exe**
@@ -151,15 +151,14 @@ sas-netdiag/
 
 Logs are written to: `%USERPROFILE%\.sas-netdiag\netdiag.log`
 
-If the application crashes, send this file to Contact@SASControls.com for support.
+
 
 ---
 
 ## Future Phases
 
 - **Phase 2** — ControlNet diagnostics
-- **Phase 3** — DeviceNet diagnostics
-- **Phase 4** — Modbus TCP/RTU diagnostics
+- **Phase 3** — Modbus TCP/RTU diagnostics
 
 ---
 
