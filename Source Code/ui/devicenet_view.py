@@ -885,7 +885,7 @@ class DeviceNetView(ctk.CTkFrame):
         # Validate driver selection
         if not driver_name or driver_name.startswith("("):
             self._progress.update_progress(
-                0, "⚠ Click 'Detect RSLinx' first to find PCDC drivers")
+                0, "⚠ Click 'Detect RSLinx' first to find available drivers")
             return
 
         if driver_name not in self._u2dn_detected_drivers:

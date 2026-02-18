@@ -915,7 +915,7 @@ class U2DNAdapter:
     @staticmethod
     def detect() -> dict:
         """
-        Detect 1784-U2DN adapter AND RSLinx/PCDC driver availability.
+        Detect 1784-U2DN adapter AND RSLinx driver availability.
         Returns dict with comprehensive detection results.
         """
         result = {
@@ -928,6 +928,8 @@ class U2DNAdapter:
             "rslinx_edition": "",
             "rslinx_version": "",
             "devicenet_drivers": [],   # List of RSLinx DeviceNet driver names
+            "all_drivers": [],         # ALL RSLinx drivers (for diagnostics)
+            "sdk_status": "",          # SDK init result for diagnostics
             "message": "",
         }
 
@@ -941,20 +943,54 @@ class U2DNAdapter:
             result["rslinx_version"] = rslinx_info.get("version", "")
         except ImportError:
             logger.warning("rslinx_bridge module not available")
+            result["sdk_status"] = "rslinx_bridge module not available"
         except Exception as e:
             logger.debug(f"RSLinx detection error: {e}")
+            result["sdk_status"] = f"RSLinx detection error: {e}"
 
-        # ── Step 2: If RSLinx SDK available, enumerate DeviceNet-capable drivers ──
+        # ── Step 2: If RSLinx SDK available, enumerate ALL drivers + probe USB ──
         if result["rslinx_running"]:
             try:
                 bridge = RSLinxBridge()
                 ok, msg = bridge.initialize()
                 if ok:
+                    result["sdk_status"] = "SDK initialized OK"
+
+                    # Get ALL enumerated drivers for diagnostic visibility
+                    all_enum_drivers = bridge.list_drivers()
+                    result["all_drivers"] = [
+                        f"{d.name} ({d.network_type_name}, type={d.network_type})"
+                        for d in all_enum_drivers
+                    ]
+
+                    # Find DeviceNet-capable drivers (includes USB probe)
                     dnet_drivers = bridge.find_devicenet_drivers()
                     result["devicenet_drivers"] = [d.name for d in dnet_drivers]
+
+                    # Track which were found by probe vs enumeration
+                    enum_names = {d.name for d in all_enum_drivers}
+                    probed = [d.name for d in dnet_drivers
+                              if d.name not in enum_names]
+                    if probed:
+                        result["sdk_status"] += (
+                            f" | USB probe found: {', '.join(probed)}")
+
+                    if not dnet_drivers:
+                        if all_enum_drivers:
+                            result["sdk_status"] += (
+                                f" | {len(all_enum_drivers)} drivers enumerated, "
+                                f"none DeviceNet-capable, USB probe also failed")
+                        else:
+                            result["sdk_status"] += (
+                                " | No drivers enumerated, USB probe also failed")
+
                     bridge.shutdown()
+                else:
+                    result["sdk_status"] = f"SDK init failed: {msg}"
+                    logger.warning(f"RSLinx SDK initialization failed: {msg}")
             except Exception as e:
-                logger.debug(f"RSLinx SDK driver enumeration failed: {e}")
+                result["sdk_status"] = f"SDK exception: {e}"
+                logger.warning(f"RSLinx SDK driver enumeration failed: {e}")
 
         # ── Step 3: Check Windows Device Manager for 1784-U2DN hardware ──
         try:
@@ -1012,7 +1048,7 @@ class U2DNAdapter:
             lines.append(f"✅ 1784-U2DN detected: {result['device_name']}")
             lines.append(f"   Driver: {'Installed' if result['driver_installed'] else 'Not found'}")
         else:
-            lines.append("❌ 1784-U2DN not detected")
+            lines.append("❌ 1784-U2DN not detected in Windows Device Manager")
 
         if result["rslinx_installed"]:
             status = "Running" if result["rslinx_running"] else "Installed (not running)"
@@ -1022,15 +1058,32 @@ class U2DNAdapter:
         else:
             lines.append("   RSLinx: Not installed")
 
+        # SDK status (always show for diagnostics)
+        if result["sdk_status"]:
+            lines.append(f"   SDK: {result['sdk_status']}")
+
+        # Show all drivers found (helps diagnose USB vs PCDC issues)
+        if result["all_drivers"]:
+            lines.append(f"   All RSLinx drivers: {', '.join(result['all_drivers'])}")
+
         if result["devicenet_drivers"]:
-            lines.append(f"   DeviceNet drivers: {', '.join(result['devicenet_drivers'])}")
-        elif result["rslinx_running"]:
-            lines.append("   DeviceNet drivers: None found — connect the 1784-U2DN and restart RSLinx")
+            lines.append(f"   DeviceNet-capable: {', '.join(result['devicenet_drivers'])}")
+        elif result["rslinx_running"] and result["sdk_status"].startswith("SDK init"):
+            lines.append("   DeviceNet-capable: None found")
+            if result["all_drivers"]:
+                lines.append("   (USB driver type 9 or DeviceNet type 7 expected)")
 
         # Can we scan?
         can_scan = (result["rslinx_running"] and len(result["devicenet_drivers"]) > 0)
         if can_scan:
             lines.append("\n✅ Ready to scan — select a driver and click Scan Network")
+        elif result["rslinx_running"] and "SDK init failed" in result.get("sdk_status", ""):
+            lines.append(f"\n⚠ RSLinx SDK (dtl32.dll) could not initialize.\n"
+                         f"   This usually means the RSLinx SDK / FactoryTalk Linx SDK\n"
+                         f"   is not licensed or installed. The SDK is required for\n"
+                         f"   direct DeviceNet scanning via the 1784-U2DN.\n\n"
+                         f"   You can still scan via Backplane Punch-Through\n"
+                         f"   (EtherNet/IP → PLC → scanner module → DeviceNet).")
         elif result["rslinx_running"]:
             lines.append("\n⚠ RSLinx is running but no DeviceNet driver found.\n"
                          "   Ensure the 1784-U2DN is connected — RSLinx should auto-detect it.\n"

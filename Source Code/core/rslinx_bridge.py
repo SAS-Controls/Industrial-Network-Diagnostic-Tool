@@ -456,7 +456,141 @@ class RSLinxBridge:
 
     def find_devicenet_drivers(self) -> List[RSLinxDriver]:
         """Find all drivers capable of DeviceNet access (PCDC, USB/U2DN, etc.)."""
-        return [d for d in self.list_drivers() if d.is_devicenet_capable]
+        drivers = [d for d in self.list_drivers() if d.is_devicenet_capable]
+
+        # USB drivers created by auto-detect (1784-U2DN) often don't appear in
+        # DTL_DRIVER_LIST_EX. Probe common USB driver names directly.
+        usb_names_found = {d.name for d in drivers if d.is_usb}
+        for usb_name in ["USB", "USB1", "USB2"]:
+            if usb_name in usb_names_found:
+                continue  # Already found via enumeration
+            station, desc = self.probe_usb_driver(usb_name)
+            if station >= 0:
+                drv = RSLinxDriver(
+                    name=usb_name,
+                    network_type=NET_TYPE_USB,
+                    network_type_name="USB",
+                    is_usb=True,
+                    is_devicenet_capable=True,
+                    station=station,
+                )
+                drivers.append(drv)
+                logger.info(f"USB driver '{usb_name}' found via direct probe "
+                           f"(station {station}: {desc})")
+
+        return drivers
+
+    def probe_usb_driver(
+        self,
+        driver_name: str,
+        timeout_ms: int = 2000,
+    ) -> Tuple[int, str]:
+        """
+        Probe whether a USB driver exists and find the adapter station
+        by attempting DTSA paths. Returns (station, description) or (-1, msg).
+
+        Tries multiple path formats since RSLinx USB driver paths vary:
+          Format 1: DRIVER\\1,STATION  (port 1, station N)
+          Format 2: DRIVER\\STATION    (bare address, no port)
+        """
+        if not self._initialized:
+            return -1, "DTL not initialized"
+
+        # Try common adapter station numbers
+        # 1784-U2DN typically appears at station 16 (from RSLinx RSWho)
+        # but can also be at 2, 0, etc.
+        probe_stations = [16, 2, 0, 1, 3, 4, 5, 6, 7, 8] + list(range(9, 33))
+
+        # Path format patterns to try for each station
+        path_templates = [
+            lambda drv, stn: f"{drv}\\1,{stn}",   # Port 1, station N
+            lambda drv, stn: f"{drv}\\{stn}",      # Bare address
+        ]
+
+        errors_seen = set()
+
+        for station in probe_stations:
+            for fmt_idx, fmt in enumerate(path_templates):
+                try:
+                    path = fmt(driver_name, station)
+                    path_bytes = path.encode("ascii")
+
+                    dtsa = self._dll.DTL_CreateDtsaFromPathString(path_bytes)
+                    if not dtsa:
+                        errors_seen.add(f"CreateDtsa NULL: '{path}'")
+                        continue
+
+                    status = self._dll.DTL_OpenDtsa(dtsa)
+                    if status != DTL_SUCCESS:
+                        err = self._get_error_string(status)
+                        errors_seen.add(f"OpenDtsa '{path}': {err} ({status})")
+                        self._dll.DTL_DestroyDtsa(dtsa)
+
+                        # If driver not found, skip remaining stations for this format
+                        if status in (-9, -14):  # DRIVER_NOT_FOUND, PATH_NOT_FOUND
+                            logger.debug(f"USB probe '{path}': {err} — "
+                                       f"skipping format {fmt_idx}")
+                            break
+                        continue
+
+                    # Build CIP Get_Attributes_All for Identity Object
+                    cip_path = self.build_cip_path(CIP_CLASS_IDENTITY, 1)
+                    path_size_words = len(cip_path) // 2
+                    req_path_buf = create_string_buffer(cip_path)
+                    rsp_buf = create_string_buffer(256)
+                    rsp_size = c_ushort(256)
+
+                    msg_status = self._dll.DTL_CIP_MESSAGE_SEND_W(
+                        dtsa,
+                        c_ubyte(CIP_GET_ATTR_ALL),
+                        req_path_buf,
+                        c_ushort(path_size_words),
+                        None,
+                        c_ushort(0),
+                        rsp_buf,
+                        byref(rsp_size),
+                        c_ulong(timeout_ms),
+                    )
+
+                    try:
+                        self._dll.DTL_CloseDtsa(dtsa)
+                    except Exception:
+                        pass
+                    self._dll.DTL_DestroyDtsa(dtsa)
+
+                    if msg_status == DTL_SUCCESS and rsp_size.value > 0:
+                        desc = f"Adapter at station {station}"
+                        # Try to extract product name from identity response
+                        if rsp_size.value > 4:
+                            raw = bytes(rsp_buf.raw[:rsp_size.value])
+                            ext_size = raw[3] if len(raw) > 3 else 0
+                            data_offset = 4 + (ext_size * 2)
+                            if data_offset < len(raw):
+                                try:
+                                    from core.devicenet_diag import decode_identity_object
+                                    identity = decode_identity_object(raw[data_offset:])
+                                    pname = identity.get("product_name", "")
+                                    if pname:
+                                        desc = pname
+                                except Exception:
+                                    pass
+                        logger.info(f"USB probe SUCCESS: '{path}' → {desc}")
+                        return station, desc
+                    else:
+                        if msg_status != DTL_SUCCESS:
+                            err = self._get_error_string(msg_status)
+                            errors_seen.add(f"CIP msg '{path}': {err}")
+
+                except Exception as e:
+                    errors_seen.add(f"Exception '{path}': {e}")
+
+        # Log diagnostic summary if we failed
+        if errors_seen:
+            sample = list(errors_seen)[:5]
+            logger.info(f"USB probe failed for driver '{driver_name}'. "
+                       f"Errors ({len(errors_seen)} total): {sample}")
+
+        return -1, f"No adapter found on driver '{driver_name}'"
 
     # ── CIP Messaging ────────────────────────────────────────────────────
 
@@ -688,82 +822,13 @@ class RSLinxBridge:
         timeout_ms: int = 3000,
     ) -> Tuple[int, str]:
         """
-        Discover the 1784-U2DN adapter station on a USB driver by probing
-        common station addresses with CIP Identity reads.
-
-        The U2DN's station number on the USB bus is typically a low number
-        (commonly 2, 16, or set by hardware). We probe a range of addresses
-        to find a device that responds.
+        Discover the 1784-U2DN adapter station on a USB driver.
+        Delegates to probe_usb_driver with a longer timeout.
 
         Returns:
             (station_number, description) — station_number is -1 if not found
         """
-        if not self._initialized:
-            return -1, "DTL not initialized"
-
-        # Try common station numbers — U2DN typically shows up at 2 or 16
-        # Probe up to 32 stations to cover most configurations
-        probe_stations = [2, 16, 0, 1, 3, 4, 5, 6, 7, 8] + list(range(9, 33))
-
-        for station in probe_stations:
-            try:
-                # Try reading Identity Object at this station
-                # Path: DRIVER\1,STATION — read the adapter itself (not a DN node)
-                path_str = f"{driver_name}\\1,{station}".encode("ascii")
-
-                dtsa = self._dll.DTL_CreateDtsaFromPathString(path_str)
-                if not dtsa:
-                    continue
-
-                status = self._dll.DTL_OpenDtsa(dtsa)
-                if status != DTL_SUCCESS:
-                    self._dll.DTL_DestroyDtsa(dtsa)
-                    continue
-
-                # Build CIP Get_Attributes_All for Identity Object
-                cip_path = self.build_cip_path(CIP_CLASS_IDENTITY, 1)
-                path_size_words = len(cip_path) // 2
-                req_path_buf = create_string_buffer(cip_path)
-                rsp_buf = create_string_buffer(256)
-                rsp_size = c_ushort(256)
-
-                msg_status = self._dll.DTL_CIP_MESSAGE_SEND_W(
-                    dtsa,
-                    c_ubyte(CIP_GET_ATTR_ALL),
-                    req_path_buf,
-                    c_ushort(path_size_words),
-                    None,
-                    c_ushort(0),
-                    rsp_buf,
-                    byref(rsp_size),
-                    c_ulong(timeout_ms),
-                )
-
-                try:
-                    self._dll.DTL_CloseDtsa(dtsa)
-                except Exception:
-                    pass
-                self._dll.DTL_DestroyDtsa(dtsa)
-
-                if msg_status == DTL_SUCCESS and rsp_size.value > 4:
-                    # Parse identity to get product name
-                    raw = bytes(rsp_buf.raw[:rsp_size.value])
-                    # Skip CIP response header (4 bytes min)
-                    if len(raw) >= 4:
-                        ext_size = raw[3] if len(raw) > 3 else 0
-                        data_offset = 4 + (ext_size * 2)
-                        if data_offset < len(raw):
-                            from core.devicenet_diag import decode_identity_object
-                            identity = decode_identity_object(raw[data_offset:])
-                            pname = identity.get("product_name", "")
-                            logger.info(
-                                f"USB adapter found at station {station}: {pname}")
-                            return station, pname
-
-            except Exception as e:
-                logger.debug(f"USB probe station {station}: {e}")
-
-        return -1, "No USB adapter found"
+        return self.probe_usb_driver(driver_name, timeout_ms=timeout_ms)
 
 
 # ── RSLinx Status Check (no SDK required) ────────────────────────────────

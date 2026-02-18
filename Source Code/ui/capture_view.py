@@ -83,6 +83,7 @@ class PacketCaptureView(ctk.CTkFrame):
         self._interfaces: List[CaptureInterface] = []
         self._analysis: Optional[CaptureAnalysis] = None
         self._capturing = False
+        self._capture_iface = None  # Interface used for last capture
 
         self._build_ui()
         self._interfaces_loaded = False
@@ -314,6 +315,8 @@ class PacketCaptureView(ctk.CTkFrame):
         if not iface:
             logger.warning("No interface selected")
             return
+
+        self._capture_iface = iface  # Save for PDF report
 
         # Get duration
         try:
@@ -807,90 +810,78 @@ class PacketCaptureView(ctk.CTkFrame):
     # ── Export ────────────────────────────────────────────────────────────────
 
     def _export_report(self):
-        """Export analysis results to a text report."""
+        """Export analysis results to a branded PDF report."""
         if not self._analysis:
             return
 
-        a = self._analysis
+        from tkinter import filedialog
 
-        # Build report text
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"capture_report_{timestamp}.txt"
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        default_name = f"Capture_Report_{timestamp}.pdf"
 
-        # Save to user's Documents or Desktop
-        docs_path = os.path.expanduser("~/Documents")
-        if not os.path.isdir(docs_path):
-            docs_path = os.path.expanduser("~/Desktop")
-        filepath = os.path.join(docs_path, filename)
+        output_path = filedialog.asksaveasfilename(
+            title="Save Capture Analysis Report",
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")],
+            initialfile=default_name,
+            initialdir=os.path.join(os.path.expanduser("~"), "Documents"),
+        )
+        if not output_path:
+            return  # User cancelled
 
+        self._export_btn.configure(text="⏳ Generating...", state="disabled")
+        self.update_idletasks()
+
+        iface_name = str(self._capture_iface) if self._capture_iface else ""
+        iface_ip = getattr(self._capture_iface, "ip_address", "")
+
+        def _generate():
+            try:
+                from core.pdf_report import generate_capture_report
+                generate_capture_report(
+                    analysis=self._analysis,
+                    interface_name=iface_name,
+                    interface_ip=iface_ip,
+                    output_path=output_path,
+                )
+                self.after(0, lambda: self._export_success(output_path))
+            except Exception as e:
+                logger.error(f"PDF export failed: {e}", exc_info=True)
+                self.after(0, lambda: self._export_failure(str(e)))
+
+        threading.Thread(target=_generate, daemon=True).start()
+
+    def _export_success(self, path: str):
+        """Handle successful PDF export."""
+        filename = os.path.basename(path)
+        self._export_btn.configure(text=f"✅ Saved: {filename}", state="normal")
+        self.after(3000, lambda: self._export_btn.configure(
+            text="📄  Export Report"))
+
+        # Open the PDF
         try:
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write("=" * 70 + "\n")
-                f.write(f"  {APP_FULL_NAME} — Packet Capture Report\n")
-                f.write(f"  {APP_COMPANY}\n")
-                f.write(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 70 + "\n\n")
+            import platform
+            if platform.system() == "Windows":
+                os.startfile(path)
+            elif platform.system() == "Darwin":
+                import subprocess
+                subprocess.Popen(["open", path])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
 
-                f.write(f"CAPTURE SUMMARY\n")
-                f.write(f"  Packets:     {a.total_packets:,}\n")
-                f.write(f"  Bytes:       {_format_bytes(a.total_bytes)}\n")
-                f.write(f"  Duration:    {a.duration_seconds:.0f} seconds\n")
-                f.write(f"  Hosts:       {a.unique_hosts}\n")
-                f.write(f"  Health:      {a.health_score}/100\n")
-                f.write(f"  Broadcast:   {a.broadcast_pct:.1f}%\n")
-                f.write(f"  Multicast:   {a.multicast_pct:.1f}%\n")
-                f.write(f"  TCP Retx:    {a.tcp_retransmission_pct:.1f}%\n\n")
-
-                f.write(f"PROTOCOL BREAKDOWN\n")
-                for proto, count in sorted(a.protocol_breakdown.items(),
-                                           key=lambda x: -x[1]):
-                    pct = (count / a.total_packets * 100) if a.total_packets else 0
-                    f.write(f"  {proto:20s}  {count:>8,}  ({pct:5.1f}%)\n")
-                f.write("\n")
-
-                f.write(f"TOP TALKERS (BY BYTES)\n")
-                for ip, bytes_val in a.top_talkers_by_bytes[:10]:
-                    f.write(f"  {ip:20s}  {_format_bytes(bytes_val):>10s}\n")
-                f.write("\n")
-
-                f.write(f"DIAGNOSTIC FINDINGS\n")
-                f.write("-" * 70 + "\n")
-                for finding in a.findings:
-                    sev = finding.severity.upper()
-                    f.write(f"\n[{sev}] {finding.title}\n")
-                    f.write(f"  {finding.summary}\n")
-                    if finding.explanation:
-                        f.write(f"\n  What This Means:\n")
-                        for line in finding.explanation.split("\n"):
-                            f.write(f"  {line}\n")
-                    if finding.recommendation:
-                        f.write(f"\n  What To Do:\n")
-                        for line in finding.recommendation.split("\n"):
-                            f.write(f"  {line}\n")
-                    f.write("-" * 70 + "\n")
-
-                if a.timeline:
-                    f.write(f"\nTIMELINE EVENTS ({len(a.timeline)} total)\n")
-                    for event in sorted(a.timeline, key=lambda e: e.timestamp):
-                        f.write(f"  {event.timestamp:6.1f}s  [{event.severity}]  "
-                                f"{event.description}\n")
-
-                f.write(f"\n{'=' * 70}\n")
-                f.write(f"  End of Report\n")
-                f.write(f"{'=' * 70}\n")
-
-            # Show success
-            self._export_btn.configure(text=f"✅ Saved to {filename}")
-            self.after(3000, lambda: self._export_btn.configure(
-                text="📄  Export Report"))
-
-            logger.info(f"Report exported to {filepath}")
-
-        except Exception as e:
-            logger.error(f"Export failed: {e}")
-            self._export_btn.configure(text="❌ Export failed")
-            self.after(3000, lambda: self._export_btn.configure(
-                text="📄  Export Report"))
+    def _export_failure(self, error: str):
+        """Handle PDF export failure."""
+        if "reportlab" in error.lower() or "No module" in error:
+            self._export_btn.configure(
+                text="⚠ Install reportlab", state="normal")
+        else:
+            self._export_btn.configure(
+                text="❌ Export failed", state="normal")
+        self.after(3000, lambda: self._export_btn.configure(
+            text="📄  Export Report"))
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

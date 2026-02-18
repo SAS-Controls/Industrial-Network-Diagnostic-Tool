@@ -411,6 +411,22 @@ class DeviceFinderView(ctk.CTkFrame):
                     adapter_ip=self._selected_iface.ip_address if self._selected_iface else "",
                 )
                 logger.info(f"Discovery completed: {len(results)} devices found")
+
+                # Online MAC vendor enrichment for unknown devices
+                if results and not (self._cancel_event and self._cancel_event.is_set()):
+                    self.after(0, lambda: self._progress.update_progress(
+                        0.98, "Looking up unknown vendors online..."))
+                    try:
+                        from core.mac_online_lookup import enrich_devices_online
+                        enriched = enrich_devices_online(
+                            results, cancel_event=self._cancel_event)
+                        if enriched > 0:
+                            logger.info(f"Online MAC lookup enriched {enriched} finder devices")
+                    except ImportError:
+                        pass
+                    except Exception as e:
+                        logger.debug(f"Online MAC enrichment (finder) failed: {e}")
+
                 self.after(0, lambda: self._discovery_complete(results))
             except Exception as e:
                 logger.error(f"Discovery failed: {e}", exc_info=True)

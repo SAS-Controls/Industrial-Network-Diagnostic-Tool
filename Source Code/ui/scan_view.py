@@ -3,7 +3,9 @@ SAS Network Diagnostics Tool — Scan View
 The main scanning interface where users select an interface and scan the network.
 """
 
+import ipaddress
 import logging
+import os
 import threading
 import time
 import tkinter as tk
@@ -82,6 +84,7 @@ class ScanView(ctk.CTkFrame):
             button_color=SAS_BLUE, button_hover_color=SAS_BLUE_DARK,
             dropdown_fg_color=BG_MEDIUM, dropdown_hover_color=BG_CARD_HOVER,
             width=400, height=INPUT_HEIGHT, state="readonly",
+            command=lambda _: self._update_range_label(),
         )
         self._iface_dropdown.pack(anchor="w", pady=(4, 0))
 
@@ -106,6 +109,73 @@ class ScanView(ctk.CTkFrame):
             command=self._start_scan,
         )
         self._scan_btn.pack(side="left")
+
+        # ── Scan Range ────────────────────────────────────────────────────────
+        range_frame = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=CARD_CORNER_RADIUS,
+                                    border_width=1, border_color=BORDER_COLOR)
+        range_frame.pack(fill="x", padx=20, pady=(0, 12))
+
+        range_inner = ctk.CTkFrame(range_frame, fg_color="transparent")
+        range_inner.pack(fill="x", padx=CARD_PADDING, pady=(10, 10))
+
+        ctk.CTkLabel(
+            range_inner, text="Scan Range",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
+            text_color=TEXT_PRIMARY,
+        ).pack(anchor="w", pady=(0, 4))
+
+        range_row = ctk.CTkFrame(range_inner, fg_color="transparent")
+        range_row.pack(fill="x")
+
+        # Radio-style: Interface subnet (default) vs Custom range
+        self._range_mode = ctk.StringVar(value="auto")
+
+        self._range_auto_rb = ctk.CTkRadioButton(
+            range_row, text="Interface subnet",
+            variable=self._range_mode, value="auto",
+            font=(FONT_FAMILY, FONT_SIZE_BODY),
+            text_color=TEXT_SECONDARY,
+            fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK,
+            border_color=BORDER_COLOR,
+            command=self._on_range_mode_change,
+        )
+        self._range_auto_rb.pack(side="left")
+
+        self._range_auto_label = ctk.CTkLabel(
+            range_row, text="(select an interface)",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            text_color=TEXT_MUTED,
+        )
+        self._range_auto_label.pack(side="left", padx=(8, 24))
+
+        self._range_custom_rb = ctk.CTkRadioButton(
+            range_row, text="Custom range:",
+            variable=self._range_mode, value="custom",
+            font=(FONT_FAMILY, FONT_SIZE_BODY),
+            text_color=TEXT_SECONDARY,
+            fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK,
+            border_color=BORDER_COLOR,
+            command=self._on_range_mode_change,
+        )
+        self._range_custom_rb.pack(side="left")
+
+        self._range_entry = ctk.CTkEntry(
+            range_row, width=220, height=28,
+            font=(FONT_FAMILY_MONO, FONT_SIZE_BODY),
+            fg_color=BG_INPUT, border_color=BORDER_COLOR,
+            text_color=TEXT_PRIMARY,
+            placeholder_text="e.g. 192.168.1.0/24 or 10.0.0.1-10.0.0.50",
+            state="disabled",
+        )
+        self._range_entry.pack(side="left", padx=(8, 0))
+
+        # Host count hint
+        self._host_count_label = ctk.CTkLabel(
+            range_row, text="",
+            font=(FONT_FAMILY, FONT_SIZE_TINY),
+            text_color=TEXT_MUTED,
+        )
+        self._host_count_label.pack(side="left", padx=(12, 0))
 
         # ── Progress Bar ─────────────────────────────────────────────────────
         self._progress = ScanProgressBar(self)
@@ -133,6 +203,17 @@ class ScanView(ctk.CTkFrame):
         ctk.CTkLabel(list_header, text="Discovered Devices",
                      font=(FONT_FAMILY, FONT_SIZE_SUBHEADING, "bold"),
                      text_color=TEXT_PRIMARY).pack(side="left")
+
+        # Export PDF button (initially hidden, shown after scan completes)
+        self._export_btn = ctk.CTkButton(
+            list_header, text="📄 Export PDF Report", width=160, height=28,
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            fg_color=SAS_ORANGE, hover_color=SAS_ORANGE_DARK,
+            text_color="white", corner_radius=BUTTON_CORNER_RADIUS,
+            command=self._export_pdf,
+        )
+        # Don't pack yet — shown after scan
+
         self._sort_label = ctk.CTkLabel(list_header, text="",
                                          font=(FONT_FAMILY, FONT_SIZE_TINY),
                                          text_color=TEXT_MUTED)
@@ -184,9 +265,105 @@ class ScanView(ctk.CTkFrame):
                     values.append(str(iface))
             self._iface_dropdown.configure(values=values)
             self._iface_var.set(values[0])
+            # Update range label for the first interface
+            self._update_range_label()
         else:
             self._iface_dropdown.configure(values=["No interfaces found"])
             self._iface_var.set("No interfaces found")
+
+    def _on_range_mode_change(self):
+        """Toggle custom range entry enabled/disabled."""
+        if self._range_mode.get() == "custom":
+            self._range_entry.configure(state="normal")
+            # Pre-populate with the auto subnet if empty
+            if not self._range_entry.get().strip():
+                iface = self._get_selected_interface()
+                if iface:
+                    import ipaddress
+                    net = ipaddress.IPv4Network(
+                        f"{iface.ip_address}/{iface.subnet_mask}", strict=False)
+                    # Default to /24 of the interface IP
+                    base = str(net.network_address)
+                    self._range_entry.delete(0, "end")
+                    self._range_entry.insert(0, f"{base}/{min(net.prefixlen, 24)}")
+        else:
+            self._range_entry.configure(state="disabled")
+        self._update_host_count()
+
+    def _update_range_label(self):
+        """Update the auto-range label when interface changes."""
+        iface = self._get_selected_interface()
+        if iface:
+            import ipaddress
+            net = ipaddress.IPv4Network(
+                f"{iface.ip_address}/{iface.subnet_mask}", strict=False)
+            # Cap at /24 for display
+            prefix = min(net.prefixlen, 24)
+            display_net = ipaddress.IPv4Network(
+                f"{iface.ip_address}/{prefix}", strict=False)
+            host_count = display_net.num_addresses - 2
+            self._range_auto_label.configure(
+                text=f"{display_net.network_address}/{prefix}  ({host_count} hosts)"
+            )
+        else:
+            self._range_auto_label.configure(text="(select an interface)")
+        self._update_host_count()
+
+    def _update_host_count(self):
+        """Show estimated host count for current range selection."""
+        import ipaddress
+        try:
+            net = self._get_scan_network()
+            if net:
+                count = net.num_addresses - 2
+                self._host_count_label.configure(
+                    text=f"≈ {count} hosts to scan",
+                    text_color=STATUS_WARN if count > 512 else TEXT_MUTED,
+                )
+            else:
+                self._host_count_label.configure(text="")
+        except Exception:
+            self._host_count_label.configure(text="")
+
+    def _get_scan_network(self):
+        """
+        Get the IPv4Network to scan based on range mode.
+        Returns None if invalid.
+        """
+        import ipaddress
+        iface = self._get_selected_interface()
+        if not iface:
+            return None
+
+        if self._range_mode.get() == "custom":
+            raw = self._range_entry.get().strip()
+            if not raw:
+                return None
+            try:
+                # Try CIDR notation first
+                return ipaddress.IPv4Network(raw, strict=False)
+            except ValueError:
+                pass
+            # Try range format: 10.0.0.1-10.0.0.50
+            try:
+                if "-" in raw:
+                    parts = raw.split("-", 1)
+                    start = ipaddress.IPv4Address(parts[0].strip())
+                    end = ipaddress.IPv4Address(parts[1].strip())
+                    # Find the smallest CIDR that covers the range
+                    nets = list(ipaddress.summarize_address_range(start, end))
+                    if nets:
+                        return nets[0]
+                return None
+            except Exception:
+                return None
+        else:
+            # Auto mode: use interface subnet, capped at /24
+            net = ipaddress.IPv4Network(
+                f"{iface.ip_address}/{iface.subnet_mask}", strict=False)
+            prefix = min(net.prefixlen, 24)
+            return ipaddress.IPv4Network(
+                f"{iface.ip_address}/{prefix}", strict=False)
 
     def _get_selected_interface(self) -> Optional[NetworkInterface]:
         selected = self._iface_var.get()
@@ -205,6 +382,11 @@ class ScanView(ctk.CTkFrame):
         if not iface:
             return
 
+        scan_network = self._get_scan_network()
+        if not scan_network:
+            self._progress.update_progress(0, "Invalid scan range — check your input")
+            return
+
         self._scanning = True
         self._cancel_event.clear()
         self._scan_btn.configure(text="⏹ Stop Scan", fg_color=STATUS_ERROR,
@@ -213,21 +395,25 @@ class ScanView(ctk.CTkFrame):
         self._devices.clear()
         self._eip_devices.clear()
         self._clear_device_list()
+        self._export_btn.pack_forget()
+
+        host_count = scan_network.num_addresses - 2
 
         def run_scan():
             try:
-                logger.info(f"Scan started on {iface.name} ({iface.ip_address}/{iface.subnet_mask}) "
-                            f"— {iface.host_count:,} hosts to sweep")
+                logger.info(f"Scan started on {iface.name} ({iface.ip_address}) "
+                            f"range {scan_network} — {host_count:,} hosts to sweep")
 
                 # Phase 1: Ping sweep
-                self.after(0, lambda: self._progress.update_progress(0.0, "Scanning network (ping sweep)..."))
+                self.after(0, lambda: self._progress.update_progress(0.0,
+                    f"Scanning {scan_network} ({host_count} hosts)..."))
 
                 def ping_progress(current, total, ip):
                     pct = current / total * 0.5  # Ping sweep is first 50%
                     self.after(0, lambda: self._progress.update_progress(
                         pct, f"Pinging {ip}... ({current}/{total})"))
 
-                devices = ping_sweep(iface.network, ping_progress, self._cancel_event,
+                devices = ping_sweep(scan_network, ping_progress, self._cancel_event,
                                      source_ip=iface.ip_address)
 
                 if self._cancel_event.is_set():
@@ -302,6 +488,27 @@ class ScanView(ctk.CTkFrame):
                 self._devices = sorted(devices, key=lambda d: tuple(
                     int(p) for p in d.ip_address.split(".")))
 
+                # Phase 4: Online MAC vendor enrichment
+                # Try to resolve unknown vendors via internet API
+                self.after(0, lambda: self._progress.update_progress(
+                    0.96, "Looking up unknown MAC vendors online..."))
+
+                try:
+                    from core.mac_online_lookup import enrich_devices_online_sync
+                    unknowns = [d for d in self._devices
+                                if d.mac_address and (not d.vendor or d.vendor == "Unknown")]
+                    if unknowns:
+                        enriched = enrich_devices_online_sync(
+                            unknowns,
+                            cancel_event=self._cancel_event,
+                        )
+                        if enriched > 0:
+                            logger.info(f"Online MAC lookup enriched {enriched} devices")
+                except ImportError:
+                    logger.debug("mac_online_lookup module not available")
+                except Exception as e:
+                    logger.debug(f"Online MAC enrichment failed: {e}")
+
                 # Done
                 self.after(0, self._scan_complete)
 
@@ -355,6 +562,12 @@ class ScanView(ctk.CTkFrame):
         self._sort_label.configure(
             text=f"Sorted by IP address • {total} devices "
                  f"• {identified} identified by manufacturer")
+
+        # Show Export PDF button if we have results
+        if total > 0:
+            self._export_btn.pack(side="right", padx=(0, 12))
+        else:
+            self._export_btn.pack_forget()
 
         self._populate_device_list()
 
@@ -424,6 +637,96 @@ class ScanView(ctk.CTkFrame):
         eip_identity = self._eip_devices.get(device.ip_address)
         if self._on_device_select:
             self._on_device_select(device, eip_identity)
+
+    def _export_pdf(self):
+        """Export scan results to a branded PDF report with Save-As dialog."""
+        if not self._devices:
+            return
+
+        from tkinter import filedialog
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        default_name = f"Network_Scan_{timestamp}.pdf"
+
+        output_path = filedialog.asksaveasfilename(
+            title="Save Network Scan Report",
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")],
+            initialfile=default_name,
+            initialdir=os.path.join(os.path.expanduser("~"), "Documents"),
+        )
+        if not output_path:
+            return  # User cancelled
+
+        self._export_btn.configure(
+            text="⏳ Generating...", state="disabled",
+            fg_color=TEXT_MUTED,
+        )
+        self.update_idletasks()
+
+        # Get the interface info for the report
+        iface = self._get_selected_interface()
+        iface_name = iface.name if iface else ""
+        iface_ip = iface.ip_address if iface else ""
+
+        def _generate():
+            try:
+                from core.pdf_report import generate_scan_report
+
+                generate_scan_report(
+                    devices=self._devices,
+                    eip_identities=self._eip_devices,
+                    interface_name=iface_name,
+                    interface_ip=iface_ip,
+                    output_path=output_path,
+                )
+                self.after(0, lambda: self._export_complete(output_path))
+            except Exception as e:
+                logger.error(f"PDF export failed: {e}", exc_info=True)
+                self.after(0, lambda: self._export_error(str(e)))
+
+        threading.Thread(target=_generate, daemon=True).start()
+
+    def _export_complete(self, path: str):
+        """Handle successful PDF export."""
+        self._export_btn.configure(
+            text="📄 Export PDF Report", state="normal",
+            fg_color=SAS_ORANGE,
+        )
+
+        # Open the file location
+        try:
+            import subprocess
+            import platform
+            if platform.system() == "Windows":
+                # Open the PDF directly
+                os.startfile(path)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+        # Brief status update
+        filename = os.path.basename(path)
+        self._progress.set_complete(f"PDF saved: {filename}")
+
+    def _export_error(self, error: str):
+        """Handle PDF export failure."""
+        self._export_btn.configure(
+            text="📄 Export PDF Report", state="normal",
+            fg_color=SAS_ORANGE,
+        )
+
+        # Check if it's a missing dependency
+        if "reportlab" in error.lower() or "No module" in error:
+            self._progress.update_progress(
+                0, "⚠ PDF export requires 'reportlab'. "
+                   "Run: pip install reportlab")
+        else:
+            self._progress.update_progress(0, f"⚠ PDF export failed: {error}")
 
     def get_devices(self) -> List[DiscoveredDevice]:
         return self._devices

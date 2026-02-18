@@ -19,15 +19,16 @@ SAS_ORANGE_LIGHT = "#F09050"
 # Each constant is a (light_mode, dark_mode) tuple.
 # CustomTkinter automatically selects the correct value based on
 # ctk.set_appearance_mode("Light" / "Dark").
-BG_DARK = ("#D5D8DC", "#1A1A2E")          # Main background
-BG_MEDIUM = ("#C8CCD0", "#16213E")        # Sidebar / section backgrounds
-BG_CARD = ("#EAECF0", "#1E2A45")          # Card backgrounds
-BG_CARD_HOVER = ("#DCE0E5", "#253352")    # Card hover state
-BG_INPUT = ("#FFFFFF", "#0F1628")          # Input field backgrounds
+# Dark mode uses neutral blacks/greys (matches SAS Trend Tool).
+BG_DARK = ("#D5D8DC", "#1E1E1E")          # Main background
+BG_MEDIUM = ("#C8CCD0", "#2B2B2B")        # Sidebar / section backgrounds
+BG_CARD = ("#EAECF0", "#333333")          # Card backgrounds
+BG_CARD_HOVER = ("#DCE0E5", "#3E3E3E")    # Card hover state
+BG_INPUT = ("#FFFFFF", "#141414")          # Input field backgrounds
 TEXT_PRIMARY = ("#1A1A2E", "#EAEAEA")      # Primary text
-TEXT_SECONDARY = ("#4A5568", "#8892A8")    # Secondary text
-TEXT_MUTED = ("#718096", "#5A6478")        # Muted / hint text
-BORDER_COLOR = ("#B0B8C4", "#2A3550")     # Borders
+TEXT_SECONDARY = ("#4A5568", "#999999")    # Secondary text
+TEXT_MUTED = ("#718096", "#666666")        # Muted / hint text
+BORDER_COLOR = ("#B0B8C4", "#444444")      # Borders
 BORDER_ACTIVE = SAS_BLUE
 
 # ── Status Colors ────────────────────────────────────────────────────────────
